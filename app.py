@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory
 from flask_wtf import FlaskForm
@@ -31,21 +32,49 @@ class UploadForm(FlaskForm):
     alpha = FloatField('Alpha', default=1.0)
     submit = SubmitField('Transfer Style')
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Absolute path resolution for model weights locally
+# ---------------------------------------------------------------------------
+# Memory-friendly setup for Render Free plan (512 MB RAM)
+# ---------------------------------------------------------------------------
+torch.set_num_threads(1)          # save CPU + memory
+device = torch.device("cpu")      # Render free plan has no GPU
+
+# Absolute path resolution for model weights
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 vgg_path = os.path.join(BASE_DIR, 'vgg_normalised.pth')
-decoder_path = os.path.join(BASE_DIR, 'decoder 1.pth')
 
-encoder = VGGEncoder(vgg_path).to(device)
-decoder = Decoder().to(device)
-decoder.load_state_dict(torch.load(decoder_path, map_location=device))
+# Prefer the renamed file (decoder_1.pth); fall back to the old name with a space
+decoder_path = os.path.join(BASE_DIR, 'decoder_1.pth')
+if not os.path.exists(decoder_path):
+    decoder_path = os.path.join(BASE_DIR, 'decoder 1.pth')
+
+# Models are loaded lazily on the first request, NOT at import time.
+# This lets gunicorn bind the port immediately so Render detects it.
+_encoder = None
+_decoder = None
 
 
+def get_models():
+    global _encoder, _decoder
+    if _encoder is None:
+        encoder = VGGEncoder(vgg_path).to(device)
+        decoder = Decoder().to(device)
 
-encoder.eval()
-decoder.eval()
+        state = torch.load(decoder_path, map_location="cpu")
+        decoder.load_state_dict(state)
+        del state
+
+        encoder.eval()
+        decoder.eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
+        for p in decoder.parameters():
+            p.requires_grad = False
+
+        _encoder, _decoder = encoder, decoder
+        gc.collect()
+    return _encoder, _decoder
+
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -120,6 +149,9 @@ def index():
                 style_image = Image.open(style_path).convert('RGB')
 
                 alpha = float(form.alpha.data)
+
+                # Load models only when first needed
+                encoder, decoder = get_models()
                 stylized_image = style_transfer(content_image, style_image, encoder, decoder, alpha, device)
 
                 result_filename = 'stylized_' + content_filename
@@ -127,6 +159,9 @@ def index():
                 save_image(stylized_image, result_path)
                 
                 result_image = result_filename
+
+                del stylized_image
+                gc.collect()
             except Exception as e:
                 error = str(e)
     # else:
